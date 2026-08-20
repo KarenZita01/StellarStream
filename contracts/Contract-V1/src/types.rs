@@ -1,5 +1,5 @@
 pub use crate::rbac::Role;
-use soroban_sdk::{contracttype, Address, BytesN, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
 
 // Interest distribution strategies
 // Bits can be combined: e.g., 0b011 = 50% sender, 50% receiver
@@ -75,7 +75,7 @@ pub struct Stream {
     pub interest_strategy: u32,
     pub vault_address: Option<Address>,
     pub deposited_principal: i128,
-    pub metadata: Option<BytesN<32>>,
+    pub stream_metadata: Option<StreamMetadata>,
     pub is_usd_pegged: bool,
     pub usd_amount: i128,
     pub oracle_address: Address,
@@ -97,6 +97,19 @@ pub struct Stream {
     pub is_frozen: bool,
     /// Stream state: Active, Paused, or Closed
     pub state: StreamState,
+}
+
+/// Optional metadata for streams to enable categorization and organization.
+///
+/// - `label`: A human-readable name for the stream (max 64 bytes).
+/// - `tags`: Up to 5 categorization tags, each max 32 bytes.
+/// - `external_ref`: Optional external reference URL or identifier.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamMetadata {
+    pub label: String,
+    pub tags: Vec<String>,
+    pub external_ref: Option<String>,
 }
 
 // Legacy Stream struct (v1) - for migration example
@@ -353,5 +366,13 @@ pub struct RequestExecutedEvent {
     pub request_id: u64,
     pub stream_id: u64,
     pub executor: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamMetadataUpdatedEvent {
+    pub stream_id: u64,
+    pub sender: Address,
     pub timestamp: u64,
 }

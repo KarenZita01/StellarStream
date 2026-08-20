@@ -34,4 +34,12 @@ pub enum Error {
     BatchSizeExceeded = 25,
     /// Stream is not paused (cannot resume)
     StreamNotPaused = 26,
+    /// Metadata label exceeds 64 character limit
+    MetadataLabelTooLong = 27,
+    /// Too many tags (maximum 5 allowed)
+    TooManyTags = 28,
+    /// Individual tag exceeds 32 character limit
+    TagTooLong = 29,
+    /// Stream has been ended and cannot be modified
+    StreamEnded = 30,
 }

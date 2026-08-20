@@ -49,6 +49,9 @@ mod voting_test;
 #[cfg(test)]
 mod ttl_stress_test;
 
+#[cfg(test)]
+mod metadata_test;
+
 use errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, Vec,
@@ -57,8 +60,8 @@ use storage::{PROPOSAL_COUNT, RECEIPT, RESTRICTED_ADDRESSES, STREAM_COUNT};
 use types::{
     ContributorRequest, CurveType, DataKey, Milestone, ProposalApprovedEvent, ProposalCreatedEvent,
     ReceiptMetadata, RequestCreatedEvent, RequestExecutedEvent, RequestKey, RequestStatus, Role,
-    Stream, StreamCreatedEvent, StreamProposal, StreamReceipt, StreamRequest,
-    StreamResumedEvent, StreamState,
+    Stream, StreamCreatedEvent, StreamMetadata, StreamMetadataUpdatedEvent, StreamProposal,
+    StreamRequest, StreamResumedEvent, StreamState,
 };
 
 #[contract]
@@ -286,6 +289,112 @@ impl StellarStreamContract {
         )
     }
 
+    /// Create a new stream with optional metadata
+    ///
+    /// # Parameters
+    /// - `stream_metadata`: Optional metadata for the stream (label, tags, external_ref).
+    pub fn create_stream_with_metadata(
+        env: Env,
+        sender: Address,
+        receiver: Address,
+        token: Address,
+        total_amount: i128,
+        start_time: u64,
+        end_time: u64,
+        curve_type: CurveType,
+        is_soulbound: bool,
+        stream_metadata: Option<StreamMetadata>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+
+        // Validate time range
+        if start_time >= end_time {
+            return Err(Error::InvalidTimeRange);
+        }
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_address_restricted(env.clone(), receiver.clone()) {
+            soroban_sdk::panic_with_error!(&env, Error::AddressRestricted);
+        }
+
+        // Validate metadata if provided
+        if let Some(ref meta) = stream_metadata {
+            if meta.label.len() > 64 {
+                return Err(Error::MetadataLabelTooLong);
+            }
+            if meta.tags.len() > 5 {
+                return Err(Error::TooManyTags);
+            }
+            for i in 0..meta.tags.len() {
+                if let Some(tag) = meta.tags.get(i) {
+                    if tag.len() > 32 {
+                        return Err(Error::TagTooLong);
+                    }
+                }
+            }
+        }
+
+        // Transfer tokens to contract
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
+        let stream_id: u64 = env.storage().instance().get(&STREAM_COUNT).unwrap_or(0);
+        let next_id = stream_id + 1;
+
+        let stream = Stream {
+            sender: sender.clone(),
+            receiver: receiver.clone(),
+            token: token.clone(),
+            total_amount,
+            start_time,
+            end_time,
+            withdrawn_amount: 0,
+            interest_strategy: 0,
+            vault_address: None,
+            deposited_principal: total_amount,
+            stream_metadata,
+            withdrawn: 0,
+            receipt_owner: receiver.clone(),
+            paused_time: 0,
+            total_paused_duration: 0,
+            milestones: Vec::new(&env),
+            curve_type,
+            is_usd_pegged: false,
+            usd_amount: 0,
+            oracle_address: sender.clone(),
+            oracle_max_staleness: 0,
+            price_min: 0,
+            price_max: 0,
+            is_soulbound,
+            clawback_enabled: false,
+            arbiter: None,
+            is_frozen: false,
+            state: StreamState::Active,
+        };
+
+        let stream_key = (STREAM_COUNT, stream_id);
+        env.storage().instance().set(&stream_key, &stream);
+        env.storage().instance().set(&STREAM_COUNT, &next_id);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("create"), sender.clone()),
+            StreamCreatedEvent {
+                stream_id,
+                sender: sender.clone(),
+                receiver: receiver.clone(),
+                token: token.clone(),
+                total_amount,
+                start_time,
+                end_time,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(stream_id)
+    }
+
     /// Create a new stream with milestones and optional soulbound locking
     ///
     /// # Parameters
@@ -347,7 +456,7 @@ impl StellarStreamContract {
             interest_strategy: 0,
             vault_address: vault_address.clone(),
             deposited_principal: total_amount,
-            metadata: None,
+            stream_metadata: None,
             withdrawn: 0,
             receipt_owner: receiver.clone(),
             paused_time: 0,
@@ -1216,6 +1325,211 @@ impl StellarStreamContract {
         stream.receipt_owner = new_owner;
         env.storage().instance().set(&stream_key, &stream);
         Ok(())
+    }
+
+    /// Update the metadata for a stream. Only the sender may update metadata.
+    ///
+    /// # Parameters
+    /// - `label`: Human-readable name for the stream (max 64 characters).
+    /// - `tags`: Up to 5 categorization tags (each max 32 characters).
+    /// - `external_ref`: Optional external reference URL or identifier.
+    ///
+    /// # Events
+    /// Emits `StreamMetadataUpdatedEvent` on success.
+    pub fn update_stream_metadata(
+        env: Env,
+        stream_id: u64,
+        sender: Address,
+        label: String,
+        tags: Vec<String>,
+        external_ref: Option<String>,
+    ) -> Result<(), Error> {
+        sender.require_auth();
+
+        let key = (STREAM_COUNT, stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(Error::Unauthorized);
+        }
+
+        if stream.state == StreamState::Closed {
+            return Err(Error::StreamEnded);
+        }
+
+        // Validate label length (max 64 characters)
+        if label.len() > 64 {
+            return Err(Error::MetadataLabelTooLong);
+        }
+
+        // Validate tag count (max 5 tags)
+        if tags.len() > 5 {
+            return Err(Error::TooManyTags);
+        }
+
+        // Validate individual tag lengths (max 32 characters each)
+        for i in 0..tags.len() {
+            if let Some(tag) = tags.get(i) {
+                if tag.len() > 32 {
+                    return Err(Error::TagTooLong);
+                }
+            }
+        }
+
+        let metadata = StreamMetadata {
+            label,
+            tags,
+            external_ref,
+        };
+
+        stream.stream_metadata = Some(metadata);
+        env.storage().instance().set(&key, &stream);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("meta_upd"), sender.clone()),
+            StreamMetadataUpdatedEvent {
+                stream_id,
+                sender,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw from multiple streams atomically. All withdrawals must succeed
+    /// for any to take effect (all-or-nothing semantics).
+    ///
+    /// # Parameters
+    /// - `stream_ids`: Vector of stream IDs to withdraw from (max 20 per call).
+    /// - `receiver`: The address receiving the funds (must be the receiver of all streams).
+    ///
+    /// # Returns
+    /// Vector of withdrawn amounts, one per stream ID.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Batch size exceeds 20 streams
+    /// - Any stream is not found, paused, closed, or unauthorized
+    /// - Insufficient balance in any stream
+    pub fn batch_withdraw(
+        env: Env,
+        stream_ids: Vec<u64>,
+        receiver: Address,
+    ) -> Result<Vec<i128>, Error> {
+        receiver.require_auth();
+
+        // Limit batch size to 20 streams
+        if stream_ids.len() > 20 {
+            return Err(Error::BatchSizeExceeded);
+        }
+
+        if stream_ids.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        // First pass: validate all streams and calculate withdrawal amounts
+        let mut withdrawal_amounts: Vec<i128> = Vec::new(&env);
+        let mut total_withdrawal: i128 = 0;
+
+        for i in 0..stream_ids.len() {
+            let stream_id = stream_ids.get(i).unwrap();
+            let key = (STREAM_COUNT, stream_id);
+            let stream: Stream = env
+                .storage()
+                .instance()
+                .get(&key)
+                .ok_or(Error::StreamNotFound)?;
+
+            if stream.receiver != receiver {
+                return Err(Error::Unauthorized);
+            }
+
+            if stream.state == StreamState::Closed {
+                return Err(Error::AlreadyCancelled);
+            }
+
+            if stream.state == StreamState::Paused {
+                return Err(Error::StreamPaused);
+            }
+
+            let current_time = env.ledger().timestamp();
+            let unlocked = Self::calculate_unlocked(&stream, current_time);
+            let to_withdraw = unlocked - stream.withdrawn_amount;
+
+            if to_withdraw <= 0 {
+                withdrawal_amounts.push_back(0);
+            } else {
+                withdrawal_amounts.push_back(to_withdraw);
+                total_withdrawal += to_withdraw;
+            }
+        }
+
+        // If total withdrawal is zero, return early
+        if total_withdrawal <= 0 {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Second pass: execute all withdrawals atomically
+        for i in 0..stream_ids.len() {
+            let stream_id = stream_ids.get(i).unwrap();
+            let amount = withdrawal_amounts.get(i).unwrap();
+
+            if amount > 0 {
+                let key = (STREAM_COUNT, stream_id);
+                let mut stream: Stream = env
+                    .storage()
+                    .instance()
+                    .get(&key)
+                    .ok_or(Error::StreamNotFound)?;
+
+                stream.withdrawn_amount += amount;
+                env.storage().instance().set(&key, &stream);
+            }
+        }
+
+        // Transfer tokens for all withdrawals in a single batch
+        // Group by token address to minimize transfers
+        let mut token_amounts: soroban_sdk::Map<Address, i128> = soroban_sdk::Map::new(&env);
+
+        for i in 0..stream_ids.len() {
+            let stream_id = stream_ids.get(i).unwrap();
+            let amount = withdrawal_amounts.get(i).unwrap();
+
+            if amount > 0 {
+                let key = (STREAM_COUNT, stream_id);
+                let stream: Stream = env
+                    .storage()
+                    .instance()
+                    .get(&key)
+                    .ok_or(Error::StreamNotFound)?;
+
+                let current = token_amounts.get(stream.token.clone()).unwrap_or(0);
+                token_amounts.set(stream.token.clone(), current + amount);
+            }
+        }
+
+        // Execute token transfers
+        let token_keys: Vec<Address> = token_amounts.keys();
+        for i in 0..token_keys.len() {
+            let token_addr = token_keys.get(i).unwrap();
+            let amount = token_amounts.get(token_addr.clone()).unwrap_or(0);
+            if amount > 0 {
+                let token_client = token::Client::new(&env, &token_addr);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &receiver,
+                    &amount,
+                );
+            }
+        }
+
+        Ok(withdrawal_amounts)
     }
 }
 
