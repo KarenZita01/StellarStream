@@ -78,6 +78,10 @@ pub enum Error {
     AddressRestricted = 22,
     StreamNotPaused = 26,
     Overflow = 27,
+    MetadataLabelTooLong = 28,
+    TooManyTags = 29,
+    TagTooLong = 30,
+    StreamEnded = 31,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +103,24 @@ pub struct Stream {
     pub is_soulbound: bool,
     pub paused_duration: u64,
     pub last_paused_at: u64,
+    pub stream_metadata: Option<StreamMetadata>,
+}
+
+// Stream metadata for categorization (issue #1466)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamMetadata {
+    pub label: String,
+    pub tags: Vec<String>,
+    pub external_ref: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamMetadataUpdatedEvent {
+    pub stream_id: u64,
+    pub sender: Address,
+    pub timestamp: u64,
 }
 
 // Minimal token interface used by `withdraw`.
@@ -178,6 +200,7 @@ impl StellarStreamContract {
             is_soulbound,
             paused_duration: 0,
             last_paused_at: 0,
+            stream_metadata: None,
         };
 
         let mut streams = get_streams(&env);
@@ -402,7 +425,77 @@ impl StellarStreamContract {
     /// Return the next stream id that will be allocated (for testing/inspection).
     pub fn next_stream_id(env: Env) -> u64 {
         env.storage().instance().get::<_, u64>(&NEXTID).unwrap_or(1)
+    
+    /// Update the metadata for a stream. Only the sender may update metadata.
+    pub fn update_stream_metadata(
+        env: Env,
+        stream_id: u64,
+        sender: Address,
+        label: String,
+        tags: Vec<String>,
+        external_ref: Option<String>,
+    ) -> Result<(), Error> {
+        sender.require_auth();
+        let mut streams = get_streams(&env);
+        let mut stream = streams.get(stream_id).ok_or(Error::StreamNotFound)?;
+        if stream.sender != sender { return Err(Error::Unauthorized); }
+        if stream.state == STATE_CLOSED { return Err(Error::StreamEnded); }
+        if label.len() > 64 { return Err(Error::MetadataLabelTooLong); }
+        if tags.len() > 5 { return Err(Error::TooManyTags); }
+        for i in 0..tags.len() {
+            if let Some(tag) = tags.get(i) {
+                if tag.len() > 32 { return Err(Error::TagTooLong); }
+            }
+        }
+        stream.stream_metadata = Some(StreamMetadata { label, tags, external_ref });
+        streams.set(stream_id, stream);
+        env.storage().persistent().set(&STREAMS, &streams);
+        env.events().publish(
+            (symbol_short!("meta_upd"), sender.clone()),
+            StreamMetadataUpdatedEvent { stream_id, sender, timestamp: env.ledger().timestamp() },
+        );
+        Ok(())
     }
+
+    /// Withdraw from multiple streams atomically. All-or-nothing semantics. (issue #1472)
+    pub fn batch_withdraw(
+        env: Env,
+        stream_ids: Vec<u64>,
+        receiver: Address,
+    ) -> Result<Vec<i128>, Error> {
+        receiver.require_auth();
+        if stream_ids.len() > 20 { return Err(Error::BatchSizeExceeded); }
+        if stream_ids.is_empty() { return Err(Error::InvalidAmount); }
+
+        let mut amounts: Vec<i128> = Vec::new(&env);
+        let mut total: i128 = 0;
+        for i in 0..stream_ids.len() {
+            let sid = stream_ids.get(i).unwrap();
+            let streams = get_streams(&env);
+            let stream = streams.get(sid).ok_or(Error::StreamNotFound)?;
+            if stream.receiver != receiver { return Err(Error::Unauthorized); }
+            if stream.state == STATE_CLOSED { return Err(Error::AlreadyCancelled); }
+            if stream.state == STATE_PAUSED { return Err(Error::StreamPaused); }
+            let unlocked = unlocked_amount(&env, &stream);
+            let w = unlocked - stream.withdrawn_amount;
+            if w > 0 { amounts.push_back(w); total += w; } else { amounts.push_back(0); }
+        }
+        if total <= 0 { return Err(Error::InsufficientBalance); }
+
+        for i in 0..stream_ids.len() {
+            let amt = amounts.get(i).unwrap();
+            if amt > 0 {
+                let sid = stream_ids.get(i).unwrap();
+                let mut streams = get_streams(&env);
+                let mut stream = streams.get(sid).unwrap();
+                stream.withdrawn_amount += amt;
+                streams.set(sid, stream.clone());
+                env.storage().persistent().set(&STREAMS, &streams);
+                TokenClient::new(&env, &stream.token).transfer(&stream.sender, &receiver, &amt);
+            }
+        }
+        Ok(amounts)
+    }}
 }
 
 // ---------------------------------------------------------------------------
@@ -624,3 +717,6 @@ mod stress_test;
 
 #[cfg(test)]
 mod security_test;
+
+
+
