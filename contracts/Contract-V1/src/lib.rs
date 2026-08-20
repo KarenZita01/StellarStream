@@ -213,7 +213,7 @@ impl StellarStreamContract {
             interest_strategy: 0,
             vault_address: None,
             deposited_principal: proposal.total_amount,
-            metadata: None,
+            stream_metadata: None,
             withdrawn: 0,
             receipt_owner: proposal.receiver.clone(),
             paused_time: 0,
