@@ -100,6 +100,7 @@ pub mod math;
 pub mod storage;
 pub mod clawback;
 pub mod compliance;
+pub mod types;
 
 #[cfg(test)]
 mod bench_test;
@@ -107,17 +108,9 @@ mod bench_test;
 mod clawback_test;
 #[cfg(test)]
 mod compliance_test;
+#[cfg(test)]
+mod types_test;
 
-<<<<<<< HEAD
-use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Env, Map, String, Vec,
-};
-use storage::{
-    bump_persistent_ttl_if_present, extend_history_ttl, extend_instance_ttl, extend_metadata_ttl,
-    extend_proposal_ttl, extend_stream_ttl, extend_template_ttl, extend_user_streams_ttl,
-    extend_user_templates_ttl, DataKey,
-=======
 // #[cfg(test)]
 // mod interest_test;
 
@@ -141,7 +134,6 @@ use types::{
     ReceiptMetadata, RequestCreatedEvent, RequestExecutedEvent, RequestKey, RequestStatus, Role,
     Stream, StreamCreatedEvent, StreamParams, StreamProposal, StreamReceipt, StreamRequest,
     StreamResumedEvent, StreamState,
->>>>>>> 66f9b0a (feat(contract): implement secure contract initialization)
 };
 
 // Stream state
@@ -252,6 +244,10 @@ pub enum Error {
     TooManyTemplates = 52,
     /// Caller is not the owner of this template.
     NotTemplateOwner = 53,
+    /// The receiver address is the same as the sender address.
+    InvalidReceiverAddress = 54,
+    /// The end time must be after the current ledger timestamp.
+    InvalidEndTime = 55,
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +649,11 @@ impl StellarStreamContract {
     }
 
     /// Create a new stream. Returns the newly allocated stream id.
+    ///
+    /// This is the core stream-creation entry point. A sender can fund a new
+    /// continuous vesting stream for a receiver, with validation, transfer,
+    /// storage, and event emission performed atomically as part of the same
+    /// contract call.
     pub fn create_stream(
         env: Env,
         sender: Address,
@@ -661,13 +662,34 @@ impl StellarStreamContract {
         total_amount: i128,
         start_time: u64,
         end_time: u64,
-        curve_type: u32,
+        curve_type: CurveType,
         is_soulbound: bool,
-        clawback_enabled: bool,
-        milestones: Option<Vec<Milestone>>,
     ) -> Result<u64, Error> {
         sender.require_auth();
         extend_instance_ttl(&env);
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if start_time >= end_time {
+            return Err(Error::InvalidTimeRange);
+        }
+        if sender == receiver {
+            return Err(Error::InvalidReceiverAddress);
+        }
+        if end_time <= env.ledger().timestamp() {
+            return Err(Error::InvalidEndTime);
+        }
+        if is_contract_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if is_restricted(&env, &sender) || is_restricted(&env, &receiver) {
+            return Err(Error::AddressRestricted);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
         let stream_id = create_stream_internal(
             &env,
             &sender,
@@ -676,11 +698,12 @@ impl StellarStreamContract {
             total_amount,
             start_time,
             end_time,
-            curve_type,
+            curve_type as u32,
             is_soulbound,
-            clawback_enabled,
-            milestones,
+            false,
+            None,
         )?;
+
         collect_protocol_fee(&env, &sender, &token, stream_id, total_amount)?;
         Ok(stream_id)
     }
